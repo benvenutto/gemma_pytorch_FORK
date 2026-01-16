@@ -1,0 +1,20 @@
+#
+# To create the environment (or overwrite an existing version, hence --yes), run:
+#
+#     conda env create --file environment.yaml --yes
+#     conda activate gemma-pytorch
+#
+# To destroy the environment, run:
+#
+#     conda deactivate
+#     conda remove --name gemma-pytorch --all
+
+name: gemma-pytorch
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python <= 3.12
+  - pip             # install pip here, so pip packages are installed locally within the conda environment
+  - wheel

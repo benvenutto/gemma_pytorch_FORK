@@ -34,19 +34,20 @@ class Sampler(nn.Module):
 
     @torch.no_grad()
     def forward(
-        self,
-        embedding: torch.Tensor,
-        hidden_states: torch.Tensor,
-        output_positions: torch.Tensor,
-        temperatures: Union[torch.Tensor, None],
-        top_ps: torch.Tensor,
-        top_ks: torch.Tensor,
-        embedding_bias: Optional[torch.Tensor] = None,
+            self,
+            embedding: torch.Tensor,
+            hidden_states: torch.Tensor,
+            output_positions: torch.Tensor,
+            temperatures: Union[torch.Tensor, None],
+            top_ps: torch.Tensor,
+            top_ks: torch.Tensor,
+            embedding_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Select the last element for each sequence.
         # (batch_size, input_len, hidden_size) -> (batch_size, hidden_size)
-        hidden_states = hidden_states.index_select(
-            1, output_positions).squeeze(dim=1)
+        # hidden_states = hidden_states.index_select(
+        #     1, output_positions).squeeze(dim=1)
+        hidden_states = hidden_states[:, output_positions].squeeze(dim=1)
         logits = torch.matmul(hidden_states, embedding.t())
         if embedding_bias is not None:
             logits += embedding_bias
@@ -91,23 +92,41 @@ class Sampler(nn.Module):
 def precompute_freqs_cis(dim: int,
                          end: int,
                          theta: float = 10000.0,
-                         rope_scaling_factor:int = 1) -> torch.Tensor:
+                         rope_scaling_factor: int = 1) -> torch.Tensor:
     """Precomputes the frequency cis."""
-    freqs = 1.0 / (theta**(torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
-    freqs = freqs/rope_scaling_factor
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+    freqs = freqs / rope_scaling_factor
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    # freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    freqs_cis_real = torch.ones_like(freqs) * torch.cos(freqs)
+    freqs_cis_imag = torch.ones_like(freqs) * torch.sin(freqs)
+    # return freqs_cis
+    return freqs_cis_real, freqs_cis_imag
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     """Applies the rotary embedding to the query and key tensors."""
-    x_ = torch.view_as_complex(
-        torch.stack(torch.chunk(x.transpose(1, 2).float(), 2, dim=-1),
-                    dim=-1))
-    x_out = torch.view_as_real(x_ * freqs_cis).type_as(x)
-    x_out = torch.cat(torch.chunk(x_out, 2, dim=-1), dim=-2)
+
+    # x_ = torch.view_as_complex(
+    #     torch.stack(torch.chunk(x.transpose(1, 2).float(), 2, dim=-1),
+    #                 dim=-1))
+
+    x_real, x_imag = torch.chunk(x.transpose(1, 2).float(), 2, dim=-1)
+
+    # x_ = torch.complex(real, imag)
+    # x_out = torch.view_as_real(x_ * freqs_cis).type_as(x)
+
+    freqs_cis_real, freqs_cis_imag = freqs_cis
+    rot_x_real = ((x_real * freqs_cis_real) - (x_imag * freqs_cis_imag)).type_as(x)
+    rot_x_imag = ((x_real * freqs_cis_imag) + (x_imag * freqs_cis_real)).type_as(x)
+
+    # x_out = torch.cat(torch.chunk(x_out, 2, dim=-1), dim=-2)
+
+    x_out = torch.cat((rot_x_real, rot_x_imag), dim=-1)
+
+    # x_out = x_out.reshape(x_out.shape[0], x_out.shape[1], x_out.shape[2],
+    #                       -1).transpose(1, 2)
     x_out = x_out.reshape(x_out.shape[0], x_out.shape[1], x_out.shape[2],
                           -1).transpose(1, 2)
     return x_out
@@ -166,10 +185,10 @@ class Embedding(nn.Module):
 class RMSNorm(torch.nn.Module):
 
     def __init__(
-        self,
-        dim: int,
-        eps: float = 1e-6,
-        add_unit_offset: bool = True,
+            self,
+            dim: int,
+            eps: float = 1e-6,
+            add_unit_offset: bool = True,
     ):
         super().__init__()
         self.eps = eps
@@ -193,10 +212,10 @@ class RMSNorm(torch.nn.Module):
 class GemmaMLP(nn.Module):
 
     def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        quant: bool,
+            self,
+            hidden_size: int,
+            intermediate_size: int,
+            quant: bool,
     ):
         super().__init__()
         self.gate_proj = Linear(hidden_size, intermediate_size, quant)
@@ -212,13 +231,50 @@ class GemmaMLP(nn.Module):
         return outputs
 
 
+class GemmaKvCache(nn.Module):
+
+    def __init__(self, config: gemma_config.GemmaConfig):
+        super().__init__()
+        self.num_hidden_layers = config.num_hidden_layers
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        for i in range(self.num_hidden_layers):
+            self.register_buffer(f'k_cache_{i}', None, persistent=False)
+            self.register_buffer(f'v_cache_{i}', None, persistent=False)
+
+    def initialise(self, batch_size: int, max_seq_len: int, device: torch.device) -> None:
+        cache_size = (
+            batch_size,
+            max_seq_len,
+            self.num_key_value_heads,
+            self.head_dim
+        )
+        for i in range(self.num_hidden_layers):
+            setattr(self, f'k_cache_{i}', torch.zeros(cache_size, dtype=torch.float16, device=device))
+            setattr(self, f'v_cache_{i}', torch.zeros(cache_size, dtype=torch.float16, device=device))
+
+    def update(self,
+               layer_index: int,
+               kv_write_indices: torch.Tensor,
+               keys: torch.Tensor,
+               values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        k_cache = getattr(self, f'k_cache_{layer_index}')
+        v_cache = getattr(self, f'v_cache_{layer_index}')
+        k_cache.index_copy_(1, kv_write_indices, keys.to(torch.float16))
+        v_cache.index_copy_(1, kv_write_indices, values.to(torch.float16))
+        # k_cache[:, kv_write_indices, :, :] = keys.to(torch.float16)
+        # v_cache[:, kv_write_indices, :, :] = values.to(torch.float16)
+        return k_cache, v_cache
+
+
 class GemmaAttention(nn.Module):
 
-    def __init__(
-        self,
-        config: gemma_config.GemmaConfig,
-        attn_type: gemma_config.AttentionType,
-    ):
+    def __init__(self,
+                 config: gemma_config.GemmaConfig,
+                 attn_type: gemma_config.AttentionType,
+                 kv_caches: GemmaKvCache,
+                 layer_index: int,
+                 ):
         super().__init__()
 
         self.num_heads = config.num_attention_heads
@@ -234,9 +290,9 @@ class GemmaAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
 
         if config.query_pre_attn_scalar is not None:
-            self.scaling = config.query_pre_attn_scalar**-0.5
+            self.scaling = config.query_pre_attn_scalar ** -0.5
         else:
-            self.scaling = self.head_dim**-0.5
+            self.scaling = self.head_dim ** -0.5
 
         self.qkv_proj = Linear(
             self.hidden_size,
@@ -259,15 +315,16 @@ class GemmaAttention(nn.Module):
         self.attn_type = attn_type
         self.sliding_window_size = config.sliding_window_size
         self.attn_logit_softcapping = config.attn_logit_softcapping
+        self.kv_caches = kv_caches
+        self.layer_index = layer_index
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        kv_write_indices: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        mask: torch.Tensor,
-        local_mask: torch.Tensor = None,
+            self,
+            hidden_states: torch.Tensor,
+            freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+            kv_write_indices: torch.Tensor,
+            mask: torch.Tensor,
+            local_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states_shape = hidden_states.shape
         assert len(hidden_states_shape) == 3
@@ -292,12 +349,19 @@ class GemmaAttention(nn.Module):
 
         # Write new kv cache.
         # [batch_size, input_len, n_local_kv_heads, head_dim]
-        k_cache, v_cache = kv_cache
-        k_cache.index_copy_(1, kv_write_indices, xk)
-        v_cache.index_copy_(1, kv_write_indices, xv)
 
-        key = k_cache
-        value = v_cache
+        ### k_cache, v_cache = kv_cache
+        ### k_cache.index_copy_(1, kv_write_indices, xk)
+        ### v_cache.index_copy_(1, kv_write_indices, xv)
+
+        key, value = self.kv_caches.update(self.layer_index,
+                                           kv_write_indices,
+                                           xk,
+                                           xv)
+
+        ### key = k_cache
+        ### value = v_cache
+
         if self.num_kv_heads != self.num_heads:
             # [batch_size, max_seq_len, n_local_heads, head_dim]
             key = torch.repeat_interleave(key, self.num_queries_per_kv, dim=2)
@@ -315,9 +379,9 @@ class GemmaAttention(nn.Module):
         q.mul_(self.scaling)
         scores = torch.matmul(q, k.transpose(2, 3))
         if (
-            self.attn_type == gemma_config.AttentionType.LOCAL_SLIDING
-            and self.sliding_window_size is not None
-            and local_mask is not None
+                self.attn_type == gemma_config.AttentionType.LOCAL_SLIDING
+                and self.sliding_window_size is not None
+                and local_mask is not None
         ):
             mask = local_mask
 
@@ -342,8 +406,8 @@ class GemmaAttention(nn.Module):
 class GemmaDecoderLayer(nn.Module):
 
     def __init__(
-        self,
-        config: gemma_config.GemmaConfig,
+            self,
+            config: gemma_config.GemmaConfig,
     ):
         super().__init__()
         self.attn_type = gemma_config.AttentionType.GLOBAL
@@ -362,13 +426,13 @@ class GemmaDecoderLayer(nn.Module):
 
     # TODO(imayank): Decouple Gemma versions into separate files.
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        kv_write_indices: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        mask: torch.Tensor,
-        local_mask: torch.Tensor,
+            self,
+            hidden_states: torch.Tensor,
+            freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+            kv_write_indices: torch.Tensor,
+            kv_cache: Tuple[torch.Tensor, torch.Tensor],
+            mask: torch.Tensor,
+            local_mask: torch.Tensor,
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
@@ -393,15 +457,19 @@ class GemmaDecoderLayer(nn.Module):
 
 class Gemma2DecoderLayer(nn.Module):
     def __init__(
-        self,
-        config: gemma_config.GemmaConfig,
-        attn_type: gemma_config.AttentionType,
+            self,
+            config: gemma_config.GemmaConfig,
+            attn_type: gemma_config.AttentionType,
+            kv_caches: GemmaKvCache,
+            layer_index: int,
     ):
         super().__init__()
         self.attn_type = attn_type
         self.self_attn = GemmaAttention(
             config=config,
             attn_type=self.attn_type,
+            kv_caches=kv_caches,
+            layer_index=layer_index,
         )
         self.mlp = GemmaMLP(
             hidden_size=config.hidden_size,
@@ -424,13 +492,12 @@ class Gemma2DecoderLayer(nn.Module):
         )
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        kv_write_indices: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        mask: torch.Tensor,
-        local_mask: torch.Tensor,
+            self,
+            hidden_states: torch.Tensor,
+            freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+            kv_write_indices: torch.Tensor,
+            mask: torch.Tensor,
+            local_mask: torch.Tensor,
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
@@ -439,7 +506,6 @@ class Gemma2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
             kv_write_indices=kv_write_indices,
-            kv_cache=kv_cache,
             mask=mask,
             local_mask=local_mask,
         )
@@ -464,33 +530,39 @@ class GemmaModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
+        self.kv_cache = GemmaKvCache(config)
 
         self.layers = nn.ModuleList()
         for i in range(config.num_hidden_layers):
             if config.architecture == gemma_config.Architecture.GEMMA_1:
                 self.layers.append(GemmaDecoderLayer(config))
             elif config.architecture in (
-                gemma_config.Architecture.GEMMA_2,
-                gemma_config.Architecture.GEMMA_3,
+                    gemma_config.Architecture.GEMMA_2,
+                    gemma_config.Architecture.GEMMA_3,
             ):
                 attn_type = (
                     config.attn_types[i % len(config.attn_types)]
                     if config.attn_types is not None
                     else gemma_config.AttentionType.GLOBAL
                 )
-                self.layers.append(Gemma2DecoderLayer(config, attn_type))
+                self.layers.append(Gemma2DecoderLayer(config,
+                                                      attn_type,
+                                                      self.kv_cache,
+                                                      i, ))
             else:
                 raise ValueError(f'Unknown architecture: {config.architecture}')
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def initialise_cache(self, batch_size: int, max_seq_len: int, device: torch.device) -> None:
+        self.kv_cache.initialise(batch_size, max_seq_len, device)
+
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        freqs_cis: Mapping[gemma_config.AttentionType, torch.Tensor],
-        kv_write_indices: torch.Tensor,
-        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
-        mask: torch.Tensor,
-        local_mask: torch.Tensor,
+            self,
+            hidden_states: torch.Tensor,
+            freqs_cis: Mapping[gemma_config.AttentionType, torch.Tensor],
+            kv_write_indices: torch.Tensor,
+            mask: torch.Tensor,
+            local_mask: torch.Tensor,
     ) -> torch.Tensor:
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -498,7 +570,6 @@ class GemmaModel(nn.Module):
                 hidden_states=hidden_states,
                 freqs_cis=freqs_cis.get(layer.attn_type),
                 kv_write_indices=kv_write_indices,
-                kv_cache=kv_caches[i],
                 mask=mask,
                 local_mask=local_mask,
             )
@@ -508,108 +579,111 @@ class GemmaModel(nn.Module):
 
 class GemmaForCausalLM(nn.Module):
 
-  def __init__(
-        self,
-        config: gemma_config.GemmaConfig,
+    def __init__(
+            self,
+            config: gemma_config.GemmaConfig,
     ):
-    super().__init__()
-    self.config = config
-    assert config.hidden_size % config.num_attention_heads == 0
+        super().__init__()
+        self.config = config
+        assert config.hidden_size % config.num_attention_heads == 0
 
-    max_seq_len = config.max_position_embeddings
-    head_dim = config.head_dim
-    vocab_size = config.vocab_size
+        max_seq_len = config.max_position_embeddings
+        head_dim = config.head_dim
+        vocab_size = config.vocab_size
 
-    self.tokenizer = tokenizer.Tokenizer(config.tokenizer)
-    self.embedder = Embedding(vocab_size, config.hidden_size, config.quant)
-    self.model = GemmaModel(config)
-    self.sampler = Sampler(vocab_size, config)
+        self.tokenizer = tokenizer.Tokenizer(config.tokenizer)
+        self.embedder = Embedding(vocab_size, config.hidden_size, config.quant)
+        self.model = GemmaModel(config)
+        self.sampler = Sampler(vocab_size, config)
 
-    # Pre-compute rotary embedding table.
-    if config.architecture == gemma_config.Architecture.GEMMA_3:
-      if config.rope_wave_length is None:
-        raise ValueError('rope_wave_length must be provided for Gemma3.')
+        # Pre-compute rotary embedding table.
+        if config.architecture == gemma_config.Architecture.GEMMA_3:
+            if config.rope_wave_length is None:
+                raise ValueError('rope_wave_length must be provided for Gemma3.')
 
-      rope_lengths = config.rope_wave_length
-      defaults = {
+            rope_lengths = config.rope_wave_length
+            defaults = {
                 gemma_config.AttentionType.LOCAL_SLIDING: 10_000,
                 gemma_config.AttentionType.GLOBAL: 10_000,
             }
 
-      for attn_type, name in [
+            for attn_type, name in [
                 (gemma_config.AttentionType.LOCAL_SLIDING, 'local_freqs_cis'),
                 (gemma_config.AttentionType.GLOBAL, 'global_freqs_cis'),
             ]:
-        theta = rope_lengths.get(
+                theta = rope_lengths.get(
                     attn_type, defaults[attn_type]
                 )
-        self._register_freqs_cis(name, head_dim, max_seq_len, theta=theta)
+                self._register_freqs_cis(name, head_dim, max_seq_len, theta=theta)
 
-    else:
-      self._register_freqs_cis('freqs_cis', head_dim, max_seq_len)
+        else:
+            self._register_freqs_cis('freqs_cis', head_dim, max_seq_len)
 
-  def _register_freqs_cis(
-        self, name: str, head_dim: int, max_seq_len: int, theta: int = 10_000
+    def _register_freqs_cis(
+            self, name: str, head_dim: int, max_seq_len: int, theta: int = 10_000
     ):
-    self.register_buffer(
-            name, precompute_freqs_cis(head_dim, max_seq_len * 2, theta=theta)
-        )
+        freqs_cis_real, freqs_cis_imag = precompute_freqs_cis(head_dim, max_seq_len * 2, theta=theta)
+        self.register_buffer(f'{name}_real', freqs_cis_real)
+        self.register_buffer(f'{name}_imag', freqs_cis_imag)
 
-  @torch.no_grad()
-  def forward(
-        self,
-        input_token_ids: torch.Tensor,
-        input_positions: torch.Tensor,
-        kv_write_indices: torch.Tensor,
-        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
-        mask: torch.Tensor,
-        output_positions: torch.Tensor,
-        temperatures: Union[torch.Tensor, None],
-        top_ps: torch.Tensor,
-        top_ks: torch.Tensor,
-        local_mask: torch.Tensor | None = None,
-        **kwargs,
+    @torch.no_grad()
+    def forward(
+            self,
+            input_token_ids: torch.Tensor,
+            input_positions: torch.Tensor,
+            # kv_write_indices: torch.Tensor,
+            mask: torch.Tensor,
+            output_positions: torch.Tensor,
+            temperatures: Union[torch.Tensor, None],
+            top_ps: torch.Tensor,
+            top_ks: torch.Tensor,
+            local_mask: torch.Tensor | None = None,
+            **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-    freqs_cis = {}
+        freqs_cis = {}
 
-    if self.config.architecture == gemma_config.Architecture.GEMMA_3:
-      freqs_cis[gemma_config.AttentionType.LOCAL_SLIDING] = (
-                self.local_freqs_cis.index_select(0, input_positions)
+        if self.config.architecture == gemma_config.Architecture.GEMMA_3:
+            freqs_cis[gemma_config.AttentionType.LOCAL_SLIDING] = (
+                self.local_freqs_cis_real.index_select(0, input_positions),
+                self.local_freqs_cis_imag.index_select(0, input_positions),
             )
-      freqs_cis[gemma_config.AttentionType.GLOBAL] = (
-                self.global_freqs_cis.index_select(0, input_positions)
+            freqs_cis[gemma_config.AttentionType.GLOBAL] = (
+                self.global_freqs_cis_real.index_select(0, input_positions),
+                self.global_freqs_cis_imag.index_select(0, input_positions),
             )
-    else:
-      freqs_cis[gemma_config.AttentionType.LOCAL_SLIDING] = (
-                self.freqs_cis.index_select(0, input_positions)
+        else:
+            freqs_cis[gemma_config.AttentionType.LOCAL_SLIDING] = (
+                self.freqs_cis_real.index_select(0, input_positions),
+                self.freqs_cis_imag.index_select(0, input_positions),
             )
-      freqs_cis[gemma_config.AttentionType.GLOBAL] = (
-                self.freqs_cis.index_select(0, input_positions)
+            freqs_cis[gemma_config.AttentionType.GLOBAL] = (
+                self.freqs_cis_real.index_select(0, input_positions),
+                self.freqs_cis_imag.index_select(0, input_positions),
             )
 
-    kv_write_indices = input_positions
+        kv_write_indices = input_positions
 
-    # [batch_size, input_len, hidden_size]
-    hidden_states = self.embedder(input_token_ids)
-    # Gemma normalizes the embedding by sqrt(hidden_size).
-    # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
-    # See https://github.com/huggingface/transformers/pull/29402
-    normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype, device=hidden_states.device)
-    hidden_states = hidden_states * normalizer
+        # [batch_size, input_len, hidden_size]
+        hidden_states = self.embedder(input_token_ids)
+        # Gemma normalizes the embedding by sqrt(hidden_size).
+        # Gemma2 downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
+        # See https://github.com/huggingface/transformers/pull/29402
+        normalizer = torch.tensor(self.config.hidden_size ** 0.5, dtype=hidden_states.dtype,
+                                  device=hidden_states.device)
+        hidden_states = hidden_states * normalizer
 
-    hidden_states = self.model(
+        hidden_states = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
             kv_write_indices=kv_write_indices,
-            kv_caches=kv_caches,
             mask=mask,
             local_mask=local_mask,
         )
-    embedder_weight = self.embedder.weight
-    if self.config.quant:
-      embedder_weight = (
-                embedder_weight * self.embedder.weight_scaler.unsqueeze(-1))
-    next_tokens, logits = self.sampler(
+        embedder_weight = self.embedder.weight
+        if self.config.quant:
+            embedder_weight = (
+                    embedder_weight * self.embedder.weight_scaler.unsqueeze(-1))
+        next_tokens, logits = self.sampler(
             embedding=embedder_weight,
             hidden_states=hidden_states,
             output_positions=output_positions,
@@ -617,82 +691,86 @@ class GemmaForCausalLM(nn.Module):
             top_ps=top_ps,
             top_ks=top_ks,
         )
-    return next_tokens, logits
+        return next_tokens, logits
 
-  def generate(
-        self,
-        prompts: Union[str, Sequence[str]],
-        device: Any,
-        output_len: int = 100,
-        temperature: Union[float, None] = 1.0,
-        top_p: float = 0.95,
-        top_k: int = 64,
+    def generate(
+            self,
+            prompts: Union[str, Sequence[str]],
+            device: Any,
+            output_len: int = 100,
+            temperature: Union[float, None] = 1.0,
+            top_p: float = 0.95,
+            top_k: int = 64,
     ) -> Union[str, Sequence[str]]:
-    """Generates responses for given prompts using Gemma model."""
-    # If a single prompt is provided, treat it as a batch of 1.
-    is_str_prompt = isinstance(prompts, str)
-    if is_str_prompt:
-      prompts = [prompts]
+        """Generates responses for given prompts using Gemma model."""
+        # If a single prompt is provided, treat it as a batch of 1.
+        is_str_prompt = isinstance(prompts, str)
+        if is_str_prompt:
+            prompts = [prompts]
 
-    batch_size = len(prompts)
-    prompt_tokens = [self.tokenizer.encode(prompt) for prompt in prompts]
-    min_prompt_len = min(len(p) for p in prompt_tokens)
-    max_prompt_len = max(len(p) for p in prompt_tokens)
-    max_seq_len = max_prompt_len + output_len
-    assert max_seq_len <= self.config.max_position_embeddings
+        batch_size = len(prompts)
+        prompt_tokens = [self.tokenizer.encode(prompt) for prompt in prompts]
+        min_prompt_len = min(len(p) for p in prompt_tokens)
+        max_prompt_len = max(len(p) for p in prompt_tokens)
+        max_seq_len = max_prompt_len + output_len
+        assert max_seq_len <= self.config.max_position_embeddings
 
-    # build KV caches
-    kv_caches = []
-    for _ in range(self.config.num_hidden_layers):
-      size = (batch_size, max_seq_len, self.config.num_key_value_heads,
-                    self.config.head_dim)
-      dtype = self.config.get_dtype()
-      k_cache = torch.zeros(size=size, dtype=dtype, device=device)
-      v_cache = torch.zeros(size=size, dtype=dtype, device=device)
-      kv_caches.append((k_cache, v_cache))
+        ### # build KV caches
+        ### kv_caches = []
+        ### for _ in range(self.config.num_hidden_layers):
+        ###   size = (batch_size, max_seq_len, self.config.num_key_value_heads,
+        ###                 self.config.head_dim)
+        ###   dtype = self.config.get_dtype()
+        ###   k_cache = torch.zeros(size=size, dtype=dtype, device=device)
+        ###   v_cache = torch.zeros(size=size, dtype=dtype, device=device)
+        ###   kv_caches.append((k_cache, v_cache))
 
-    # prepare inputs
-    token_ids_tensor = torch.full((batch_size, max_seq_len),
+        self.model.initialise_cache(batch_size, max_seq_len, device=device)
+
+        # prepare inputs
+        token_ids_tensor = torch.full((batch_size, max_seq_len),
                                       self.tokenizer.pad_id, dtype=torch.int64)
-    input_token_ids_tensor = torch.full((batch_size, min_prompt_len),
+        input_token_ids_tensor = torch.full((batch_size, min_prompt_len),
                                             self.tokenizer.pad_id,
                                             dtype=torch.int64)
-    for i, p in enumerate(prompt_tokens):
-      token_ids_tensor[i, :len(p)] = torch.tensor(p)
-      input_token_ids_tensor[i, :min_prompt_len] = torch.tensor(
+        for i, p in enumerate(prompt_tokens):
+            token_ids_tensor[i, :len(p)] = torch.tensor(p)
+            input_token_ids_tensor[i, :min_prompt_len] = torch.tensor(
                 p[:min_prompt_len])
-    token_ids_tensor = token_ids_tensor.to(device)
-    input_token_ids_tensor = input_token_ids_tensor.to(device)
-    prompt_mask_tensor = token_ids_tensor != self.tokenizer.pad_id
-    input_positions_tensor = torch.arange(0, min_prompt_len,
+        token_ids_tensor = token_ids_tensor.to(device)
+        input_token_ids_tensor = input_token_ids_tensor.to(device)
+        prompt_mask_tensor = token_ids_tensor != self.tokenizer.pad_id
+        input_positions_tensor = torch.arange(0, min_prompt_len,
                                               dtype=torch.int64).to(device)
-    mask_tensor = torch.full((1, 1, max_seq_len, max_seq_len),
+        mask_tensor = torch.full((1, 1, max_seq_len, max_seq_len),
                                  -2.3819763e38).to(torch.float)
-    mask_tensor = torch.triu(mask_tensor, diagonal=1).to(device)
-    local_mask_tensor = mask_tensor + torch.tril(
+        mask_tensor = torch.triu(mask_tensor, diagonal=1).to(device)
+        local_mask_tensor = mask_tensor + torch.tril(
             torch.full((1, 1, max_seq_len, max_seq_len), -2.3819763e38, device=device),
             diagonal=-self.config.sliding_window_size,
         ) if self.config.sliding_window_size else None
-    curr_mask_tensor = mask_tensor.index_select(2, input_positions_tensor)
-    curr_local_mask_tensor = local_mask_tensor.index_select(
-          2, input_positions_tensor
-      ) if local_mask_tensor is not None else None
-    output_positions_tensor = torch.LongTensor([min_prompt_len - 1]).to(device)
-    temperatures_tensor = None if not temperature else torch.FloatTensor(
+        # curr_mask_tensor = mask_tensor.index_select(2, input_positions_tensor)
+        curr_mask_tensor = mask_tensor[:, :, input_positions_tensor]
+        # curr_local_mask_tensor = local_mask_tensor.index_select(
+        #       2, input_positions_tensor
+        #   ) if local_mask_tensor is not None else None
+        curr_local_mask_tensor = local_mask_tensor[:, :, input_positions_tensor] \
+            if local_mask_tensor is not None else None
+        output_positions_tensor = torch.Tensor([min_prompt_len - 1]).to(device)
+        temperatures_tensor = None if not temperature else torch.FloatTensor(
             [temperature] * batch_size).to(device)
-    top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
-    top_ks_tensor = torch.LongTensor([top_k] * batch_size).to(device)
-    output_index = torch.tensor(min_prompt_len, dtype=torch.int64).to(
+        top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
+        top_ks_tensor = torch.Tensor([top_k] * batch_size).to(device)
+        output_index = torch.tensor(min_prompt_len, dtype=torch.int64).to(
             device)
 
-    # Prefill up to min_prompt_len tokens, then treat other prefill as
-    # decode and ignore output.
-    for i in range(max_seq_len - min_prompt_len):
-      next_token_ids, _ = self(
+        # Prefill up to min_prompt_len tokens, then treat other prefill as
+        # decode and ignore output.
+        for i in range(max_seq_len - min_prompt_len):
+            next_token_ids, _ = self(
                 input_token_ids=input_token_ids_tensor,
                 input_positions=input_positions_tensor,
                 kv_write_indices=None,
-                kv_caches=kv_caches,
                 mask=curr_mask_tensor,
                 output_positions=output_positions_tensor,
                 temperatures=temperatures_tensor,
@@ -701,40 +779,46 @@ class GemmaForCausalLM(nn.Module):
                 local_mask=curr_local_mask_tensor,
             )
 
-      curr_prompt_mask = prompt_mask_tensor.index_select(
-                1, output_index).squeeze(dim=1)
-      curr_token_ids = token_ids_tensor.index_select(
-                1, output_index).squeeze(dim=1)
-      output_token_ids = torch.where(curr_prompt_mask, curr_token_ids,
+            # curr_prompt_mask = prompt_mask_tensor.index_select(
+            #           1, output_index).squeeze(dim=1)
+            curr_prompt_mask = prompt_mask_tensor[:, output_index].squeeze(dim=1)
+            # curr_token_ids = token_ids_tensor.index_select(
+            #           1, output_index).squeeze(dim=1)
+            curr_token_ids = token_ids_tensor[:, output_index].squeeze(dim=1)
+            output_token_ids = torch.where(curr_prompt_mask, curr_token_ids,
                                            next_token_ids).unsqueeze(dim=1)
-      token_ids_tensor.index_copy_(1, output_index, output_token_ids)
+            # token_ids_tensor.index_copy_(1, output_index, output_token_ids)
+            token_ids_tensor[:, output_index] = output_token_ids
 
-      input_token_ids_tensor = output_token_ids
-      input_positions_tensor = output_index.unsqueeze(dim=-1)
-      curr_mask_tensor = mask_tensor.index_select(2,
-                                                        input_positions_tensor)
-      curr_local_mask_tensor = local_mask_tensor.index_select(
-                2, input_positions_tensor
-            ) if local_mask_tensor is not None else None
-      output_positions_tensor = torch.tensor(0, dtype=torch.int64).to(
+            input_token_ids_tensor = output_token_ids
+            input_positions_tensor = output_index.unsqueeze(dim=-1)
+            # curr_mask_tensor = mask_tensor.index_select(2,
+            #                                                   input_positions_tensor)
+            curr_mask_tensor = mask_tensor[:, :, input_positions_tensor]
+            # curr_local_mask_tensor = local_mask_tensor.index_select(
+            #           2, input_positions_tensor
+            #       ) if local_mask_tensor is not None else None
+            curr_local_mask_tensor = local_mask_tensor[:, :, input_positions_tensor] \
+                if local_mask_tensor is not None else None
+            output_positions_tensor = torch.tensor(0, dtype=torch.int64).to(
                 device)
-      output_index = output_index + 1
+            output_index = output_index + 1
 
-    # Detokenization.
-    token_ids = token_ids_tensor.tolist()
-    results = []
-    for i, tokens in enumerate(token_ids):
-      trimmed_output = tokens[len(prompt_tokens[i]):len(prompt_tokens[i])
-                                    + output_len]
-      if self.tokenizer.eos_id in trimmed_output:
-        eos_index = trimmed_output.index(self.tokenizer.eos_id)
-        trimmed_output = trimmed_output[:eos_index]
-      results.append(self.tokenizer.decode(trimmed_output))
+        # Detokenization.
+        token_ids = token_ids_tensor.tolist()
+        results = []
+        for i, tokens in enumerate(token_ids):
+            trimmed_output = tokens[len(prompt_tokens[i]):len(prompt_tokens[i])
+                                                          + output_len]
+            if self.tokenizer.eos_id in trimmed_output:
+                eos_index = trimmed_output.index(self.tokenizer.eos_id)
+                trimmed_output = trimmed_output[:eos_index]
+            results.append(self.tokenizer.decode(trimmed_output))
 
-    # If a string was provided as input, return a string as output.
-    return results[0] if is_str_prompt else results
+        # If a string was provided as input, return a string as output.
+        return results[0] if is_str_prompt else results
 
-  def load_weights(self, model_path: str):
+    def load_weights(self, model_path: str):
         if os.path.isfile(model_path):
             self.load_state_dict(
                 torch.load(
