@@ -24,9 +24,11 @@ def coreml_convert_model(aten_program, states=None):
         source='pytorch',
         convert_to='mlprogram',
         minimum_deployment_target=ct.target.iOS18,
-        compute_units=ct.ComputeUnit.ALL,
+        compute_precision=ct.precision.FLOAT16,
         states=states,
+        debug=True,
     )
+
     return coreml_model
 
 
