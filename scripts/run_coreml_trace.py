@@ -10,6 +10,8 @@ import coremltools as ct
 from gemma import config
 from gemma import model as gemma_model
 
+from ops.tensor_transformation import index_copy
+
 
 @contextlib.contextmanager
 def _set_default_tensor_type(dtype: torch.dtype):
