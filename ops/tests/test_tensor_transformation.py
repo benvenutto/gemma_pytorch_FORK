@@ -1,9 +1,12 @@
 from typing import Final
+from itertools import zip_longest
 
+import numpy as np
 import torch
 from coremltools.models import MLModel
 from torch import nn
 from torch.export import Dim
+from torch.testing import assert_close
 
 import coremltools as ct
 
@@ -13,21 +16,21 @@ from .test_util import torch_export_model, coreml_convert_model, run_coreml_mode
 class TestTensorIndexCopySlice(nn.Module):
     SEQUENCE_DIM: Final[int] = 1
 
-    def __init__(self, target):
+    def __init__(self, target_state):
         super().__init__()
-        self.register_buffer('target', target, persistent=False)
+        self.register_buffer('target_state', target_state, persistent=False)
 
     def forward(self, slice_indices: torch.Tensor, slice_values: torch.Tensor) -> torch.Tensor:
-        self.target.index_copy_(TestTensorIndexCopySlice.SEQUENCE_DIM, slice_indices, slice_values)
-        return self.target
+        self.target_state.index_copy_(TestTensorIndexCopySlice.SEQUENCE_DIM, slice_indices, slice_values)
+        return self.target_state
 
     # def forward(self, slice_indices: torch.Tensor, slice_values: torch.Tensor) -> torch.Tensor:
     #     # slice_index = slice_indices[0]
     #     # slice_value = slice_values[:, slice_index]
     #     slice_value = slice_values[:, 0]
     #     slice_value =  slice_value.unsqueeze(TestTensorIndexCopySlice.SEQUENCE_DIM)
-    #     self.target = self.target * slice_value     ### with broadcast
-    #     return self.target
+    #     self.target_state = self.target_state * slice_value     ### with broadcast
+    #     return self.target_state
 
 
 def test_index_copy():
@@ -42,21 +45,26 @@ def test_index_copy():
     torch_index_dtype = torch.int64
     torch_coreml_int = torch.int32
 
-    target = torch.rand((8, 24, 6, 4), dtype=torch_state_dtype, device=torch_device)
-    torch_model = TestTensorIndexCopySlice(target).to(device=torch_device)
+    target_state = torch.rand((3, 5, 2, 4), dtype=torch_state_dtype, device=torch_device)
+    torch_model = TestTensorIndexCopySlice(target_state).to(device=torch_device)
 
-    # original_target = target.clone()
-    slice_indices = torch.tensor([2, 3, 5], dtype=torch_index_dtype, device=torch_device)
-    # original_target_slice = original_target[:, slice_indices]   ### dim=1
-    slice_values = torch.rand((8, 3, 6, 4), dtype=torch_state_dtype, device=torch_device)
+    ###
+    ### Save the original target state, then update the relevant slices, and test
+    ###
+    saved_target_state = target_state.clone()
+    slice_indices = torch.tensor([2, 3, 0], dtype=torch_index_dtype, device=torch_device)
+    saved_slice_values = saved_target_state[:, slice_indices].clone()
+    slice_values = torch.rand((3, 3, 2, 4), dtype=torch_state_dtype, device=torch_device)
+    updated_target_state = torch_model(slice_indices, slice_values)
+    updated_target_state = updated_target_state.clone()
 
-    ### Update with the slice
-    updated_target = torch_model(slice_indices, slice_values)
-    # assert not torch.equal(updated_target, original_target_slice)
+    assert not torch.equal(updated_target_state, saved_target_state)
+    assert torch.equal(updated_target_state[:, slice_indices], slice_values)
 
-    # ### Update with the original values that were in the slice
-    # restored_target = torch_model(slice_indices, original_target_slice)
-    # assert torch.equal(restored_target, original_target)
+    ### Restore updated values
+    restored_target_state = torch_model(slice_indices, saved_slice_values)
+    assert torch.equal(restored_target_state, saved_target_state)
+    assert not torch.equal(updated_target_state, restored_target_state)
 
     ###
     ### Convert to CoreML model
@@ -81,9 +89,9 @@ def test_index_copy():
     state_desc = [
         ct.StateType(
             wrapped_type=ct.TensorType(
-                shape=target.shape,
+                shape=target_state.shape,
             ),
-            name='target',
+            name='target_state',
         ),
     ]
     coreml_model = coreml_convert_model(aten_program,
@@ -98,15 +106,22 @@ def test_index_copy():
 
     # coreml_model: MLModel = MLModel('pytorch_to_coreml_model.mlpackage')
 
+    slice_indices_val = slice_indices.cpu().to(dtype=torch_coreml_int).numpy()
+    slice_values_val = slice_values.cpu().to(dtype=torch_data_dtype).numpy()
     coreml_inputs = {
-        'slice_indices': slice_indices.cpu().to(dtype=torch_coreml_int).numpy(),
-        'slice_values': slice_values.cpu().to(dtype=torch_data_dtype).numpy(),
+        'slice_indices': slice_indices_val,
+        'slice_values': slice_values_val,
     }
-    target_state = target.cpu().to(dtype=torch_data_dtype).numpy()  ### Bah! use float32 not float16 ?!?
+    target_state_val = target_state.cpu().to(dtype=torch_data_dtype).numpy()          ### Bah! use float32 not float16 ?!?
     coreml_updated_target = run_coreml_model(
         coreml_model,
         coreml_inputs,
-        state_kv=('target', target_state),
+        state_kv=('target_state', target_state_val),
     )
+
+    assert not np.array_equal(coreml_updated_target['index_copy'], saved_target_state.cpu().to(dtype=torch_data_dtype).numpy())
+    assert np.array_equal(coreml_updated_target['index_copy'][:, slice_indices.cpu().numpy()],
+                          slice_values.cpu().to(dtype=torch_data_dtype).numpy())
+
 
     print(coreml_updated_target)
