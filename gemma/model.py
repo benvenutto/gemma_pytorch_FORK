@@ -69,13 +69,13 @@ class Sampler(nn.Module):
         # Apply top-p, top-k.
         probs_sum = torch.cumsum(probs_sort, dim=-1)
         top_ps_mask = (probs_sum - probs_sort) > top_ps.unsqueeze(dim=1)
-        probs_sort = torch.where(top_ps_mask, 0, probs_sort)
+        probs_sort = torch.where(top_ps_mask, 0.0, probs_sort)
 
         top_ks_mask = torch.arange(probs_idx.shape[-1],
                                    device=probs_idx.device)
         top_ks_mask = top_ks_mask.expand(probs_idx.shape[0], -1)
         top_ks_mask = top_ks_mask >= top_ks.unsqueeze(dim=1)
-        probs_sort = torch.where(top_ks_mask, 0, probs_sort)
+        probs_sort = torch.where(top_ks_mask, 0.0, probs_sort)
 
         # Re-normalization.
         probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
