@@ -10,8 +10,6 @@ import coremltools as ct
 from gemma import config
 from gemma import model as gemma_model
 
-from ops.tensor_transformation import index_copy
-
 
 @contextlib.contextmanager
 def _set_default_tensor_type(dtype: torch.dtype):
@@ -231,29 +229,20 @@ def main():
 
 
     # print(exported_program)
-
+    cache_size = torch_model.model.get_kv_cache().get_cache_size()
+    num_caches = torch_model.model.get_kv_cache().get_num_caches()
+    expected_prefix = 'model.layers.25.self_attn.kv_caches'
+    state_model = [
+        ct.StateType(wrapped_type=ct.TensorType(shape=cache_size), name=f'{expected_prefix}.{kv_name}_{layer_index}')
+        for layer_index in range(num_caches) for kv_name in ['k_cache', 'v_cache']
+    ]
     ml_model = ct.convert(
         simplified_aten_program,
         source='pytorch',
         convert_to='mlprogram',
         minimum_deployment_target=ct.target.iOS18,
         compute_units=ct.ComputeUnit.ALL,
-    #     states=[
-    #         ct.StateType(
-    #             wrapped_type=ct.TensorType(
-    #                 # shape=kv_cache_size,
-    #                 dtype=np.float16,
-    #             ),
-    #             name='k_caches',
-    #         ),
-    #         ct.StateType(
-    #             wrapped_type=ct.TensorType(
-    #                 # shape=kv_cache_size,
-    #                 dtype=np.float16,
-    #             ),
-    #             name='v_caches',
-    #         ),
-    #     ],
+        states=state_model,
     )
 
     print(f">> CoreML model:\n{ml_model}")
