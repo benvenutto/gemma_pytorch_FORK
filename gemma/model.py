@@ -24,6 +24,8 @@ from typing import Any, List, Optional, Sequence, Tuple, Union, Mapping
 from gemma import config as gemma_config
 from gemma import tokenizer
 
+from ops.tensor_transformation import index_copy, multinomial
+
 
 class Sampler(nn.Module):
 
@@ -84,7 +86,7 @@ class Sampler(nn.Module):
                              index=torch.argsort(probs_idx, dim=-1))
 
         next_token_ids = torch.multinomial(probs,
-                                           num_samples=1,
+                                           1,
                                            replacement=True).squeeze(dim=-1)
         return next_token_ids, logits
 
@@ -242,16 +244,19 @@ class GemmaKvCache(nn.Module):
             self.register_buffer(f'k_cache_{i}', None, persistent=False)
             self.register_buffer(f'v_cache_{i}', None, persistent=False)
 
+    def get_cache_size(self) -> Tuple[int, int, int, int]:
+        return self.cache_size
+
     def initialise(self, batch_size: int, max_seq_len: int, device: torch.device) -> None:
-        cache_size = (
+        self.cache_size = (
             batch_size,
             max_seq_len,
             self.num_key_value_heads,
             self.head_dim
         )
         for i in range(self.num_hidden_layers):
-            setattr(self, f'k_cache_{i}', torch.zeros(cache_size, dtype=torch.float16, device=device))
-            setattr(self, f'v_cache_{i}', torch.zeros(cache_size, dtype=torch.float16, device=device))
+            setattr(self, f'k_cache_{i}', torch.zeros(self.cache_size, dtype=torch.float16, device=device))
+            setattr(self, f'v_cache_{i}', torch.zeros(self.cache_size, dtype=torch.float16, device=device))
 
     def update(self,
                layer_index: int,
@@ -262,8 +267,6 @@ class GemmaKvCache(nn.Module):
         v_cache = getattr(self, f'v_cache_{layer_index}')
         k_cache.index_copy_(1, kv_write_indices, keys.to(torch.float16))
         v_cache.index_copy_(1, kv_write_indices, values.to(torch.float16))
-        # k_cache[:, kv_write_indices, :, :] = keys.to(torch.float16)
-        # v_cache[:, kv_write_indices, :, :] = values.to(torch.float16)
         return k_cache, v_cache
 
 
@@ -555,6 +558,9 @@ class GemmaModel(nn.Module):
 
     def initialise_cache(self, batch_size: int, max_seq_len: int, device: torch.device) -> None:
         self.kv_cache.initialise(batch_size, max_seq_len, device)
+
+    def get_kv_cache(self) -> GemmaKvCache:
+        return self.kv_cache
 
     def forward(
             self,
