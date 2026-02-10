@@ -24,8 +24,6 @@ from typing import Any, List, Optional, Sequence, Tuple, Union, Mapping
 from gemma import config as gemma_config
 from gemma import tokenizer
 
-from ops.tensor_transformation import index_copy, multinomial
-
 
 class Sampler(nn.Module):
 
@@ -241,11 +239,14 @@ class GemmaKvCache(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         for i in range(self.num_hidden_layers):
-            self.register_buffer(f'k_cache_{i}', None, persistent=False)
-            self.register_buffer(f'v_cache_{i}', None, persistent=False)
+            self.register_buffer(f'k_cache_{i}', torch.empty(0), persistent=False)
+            self.register_buffer(f'v_cache_{i}', torch.empty(0), persistent=False)
 
     def get_cache_size(self) -> Tuple[int, int, int, int]:
         return self.cache_size
+
+    def get_num_caches(self) -> int:
+        return self.num_hidden_layers
 
     def initialise(self, batch_size: int, max_seq_len: int, device: torch.device) -> None:
         self.cache_size = (
@@ -637,7 +638,6 @@ class GemmaForCausalLM(nn.Module):
             self,
             input_token_ids: torch.Tensor,
             input_positions: torch.Tensor,
-            # kv_write_indices: torch.Tensor,
             mask: torch.Tensor,
             output_positions: torch.Tensor,
             temperatures: Union[torch.Tensor, None],

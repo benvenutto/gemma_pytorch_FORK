@@ -3,12 +3,18 @@ import random
 
 import numpy as np
 import torch
+from click.core import batch
 from torch.export import Dim
 
 import coremltools as ct
+from coremltools.models.model import MLState
 
 from gemma import config
 from gemma import model as gemma_model
+
+from ops.tensor_transformation import index_copy, multinomial
+
+from util.generation import PredictorInterface, TorchPredictor, CoreMlPredictor
 
 
 @contextlib.contextmanager
@@ -47,7 +53,7 @@ def main():
         torch_model = gemma_model.GemmaForCausalLM(model_config)
         torch_model.load_weights(ckpt)
         torch_model = torch_model.to(device).eval()
-        # print(torch_model)
+
     torch_model.eval()
     print("Model loading done")
 
@@ -68,18 +74,6 @@ def main():
     min_prompt_len = min(len(p) for p in prompt_tokens)
     max_prompt_len = max(len(p) for p in prompt_tokens)
     max_seq_len = max_prompt_len + output_len
-
-    ### # build KV caches
-    ### kv_caches = []
-    ### k_caches = []
-    ### v_caches = []
-    ### kv_cache_size = (batch_size, max_seq_len, model_config.num_key_value_heads, model_config.head_dim)
-    ### for layer_num in range(model_config.num_hidden_layers):
-    ###     size = (batch_size, max_seq_len, model_config.num_key_value_heads, model_config.head_dim)
-    ###     dtype = model_config.get_dtype()
-    ###     k_cache = torch.zeros(size=size, dtype=dtype, device=device)
-    ###     v_cache = torch.zeros(size=size, dtype=dtype, device=device)
-    ###     kv_caches.append((k_cache, v_cache))
 
     torch_model.model.initialise_cache(batch_size, max_seq_len, device=device)
 
@@ -134,7 +128,6 @@ def main():
         next_token_ids, logits = torch_model(
             input_token_ids=gen_input_token_ids_tensor,
             input_positions=gen_input_positions_tensor,
-            # kv_write_indices=None,
             mask=gen_curr_mask_tensor,
             output_positions=gen_output_positions_tensor,
             temperatures=temperatures_tensor,
@@ -184,7 +177,6 @@ def main():
     model_params = (
         input_token_ids_tensor,
         input_positions_tensor,
-        # kv_write_indices_tensor,
         curr_mask_tensor,
         output_positions_tensor,
         temperatures_tensor,
@@ -194,15 +186,14 @@ def main():
     )
 
     dynamic_shapes = {
-        "input_token_ids": (Dim.AUTO, Dim.AUTO, ),
-        "input_positions": (Dim.AUTO, ),
-        # "kv_write_indices": None,
-        "mask": (Dim.AUTO, Dim.AUTO, Dim.AUTO, Dim.AUTO, ),
-        "output_positions": (Dim.AUTO,),
-        "temperatures": None,
-        "top_ps": None,
-        "top_ks": None,
-        "local_mask": (Dim.AUTO, Dim.AUTO, Dim.AUTO, Dim.AUTO, ),
+        'input_token_ids': (Dim.AUTO, Dim.AUTO, ),
+        'input_positions': (Dim.AUTO, ),
+        'mask': (Dim.AUTO, Dim.AUTO, Dim.AUTO, Dim.AUTO, ),
+        'output_positions': (Dim.AUTO,),
+        'temperatures': None,
+        'top_ps': None,
+        'top_ks': None,
+        'local_mask': (Dim.AUTO, Dim.AUTO, Dim.AUTO, Dim.AUTO, ),
     }
 
     # Export the PyTorch model, functionally simplify for inference & convert to a CoreML model
@@ -236,17 +227,45 @@ def main():
         ct.StateType(wrapped_type=ct.TensorType(shape=cache_size), name=f'{expected_prefix}.{kv_name}_{layer_index}')
         for layer_index in range(num_caches) for kv_name in ['k_cache', 'v_cache']
     ]
-    ml_model = ct.convert(
+    coreml_model = ct.convert(
         simplified_aten_program,
         source='pytorch',
         convert_to='mlprogram',
         minimum_deployment_target=ct.target.iOS18,
         compute_units=ct.ComputeUnit.ALL,
         states=state_model,
+        outputs=[ct.TensorType(name='next_tokens'), ct.TensorType(name='logits')]
     )
 
-    print(f">> CoreML model:\n{ml_model}")
+    print(f">> CoreML model:\n{coreml_model}")
     # print(logits.shape)
+
+    torch_dtype_coreml_int = torch.int32
+    torch_dtype_coreml_float = torch.float32
+
+    input_token_ids_tensor_val = input_token_ids_tensor.cpu().to(dtype=torch_dtype_coreml_int).numpy()
+    input_positions_tensor_val = input_positions_tensor.cpu().to(dtype=torch_dtype_coreml_int).numpy()
+    curr_mask_tensor_val = curr_mask_tensor.cpu().to(dtype=torch_dtype_coreml_float).numpy()
+    output_positions_tensor_val = output_positions_tensor.cpu().to(dtype=torch_dtype_coreml_int).numpy()
+    temperatures_tensor_val = temperatures_tensor.cpu().to(dtype=torch_dtype_coreml_float).numpy()
+    top_ps_tensor_val = top_ps_tensor.cpu().to(dtype=torch_dtype_coreml_float).numpy()
+    top_ks_tensor_val = top_ks_tensor.cpu().to(dtype=torch_dtype_coreml_int).numpy()
+    curr_local_mask_tensor_val = curr_local_mask_tensor.cpu().to(dtype=torch_dtype_coreml_float).numpy()
+
+    coreml_inputs = {
+        'input_token_ids': input_token_ids_tensor_val,
+        'input_positions': input_positions_tensor_val,
+        'mask': curr_mask_tensor_val,
+        'output_positions': output_positions_tensor_val,
+        'temperatures': temperatures_tensor_val,
+        'top_ps': top_ps_tensor_val,
+        'top_ks': top_ks_tensor_val,
+        'local_mask': curr_local_mask_tensor_val,
+    }
+    model_state: MLState = coreml_model.make_state()
+
+    preds = coreml_model.predict(coreml_inputs, state=model_state)
+    print(preds)
 
 
 if __name__ == "__main__":

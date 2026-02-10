@@ -1,12 +1,10 @@
 from typing import Final
-from itertools import zip_longest
 
 import numpy as np
 import torch
-from coremltools.models import MLModel
 from torch import nn
 from torch.export import Dim
-from torch.testing import assert_close
+
 
 import coremltools as ct
 

@@ -1,0 +1,1 @@
+from ops.tensor_transformation import index_copy, multinomial

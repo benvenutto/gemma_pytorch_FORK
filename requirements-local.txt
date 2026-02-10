@@ -1,4 +1,5 @@
 kaggle
 coremltools>=9.0
+pytest
 ### executorch
 asitop

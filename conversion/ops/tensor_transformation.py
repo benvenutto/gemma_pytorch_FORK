@@ -3,7 +3,7 @@ from coremltools.converters.mil.frontend.torch.ops import _get_inputs
 from coremltools.converters.mil.mil import Builder as mb
 
 
-del _TORCH_OPS_REGISTRY['multinomial']
+del _TORCH_OPS_REGISTRY['multinomial']      ### Replace shipped version, which is broken getting parameters
 
 @register_torch_op
 def index_copy(context, node):
