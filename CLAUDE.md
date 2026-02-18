@@ -119,30 +119,49 @@ Key classes (in dependency order):
 
 ### `ops/tensor_transformation.py`
 - Registers a custom CoreML MIL op (`index_copy`) via `coremltools`.
-- Used when converting the model to CoreML format on Apple Silicon.
+- Needed because `GemmaKvCache.update()` calls `index_copy_` (scatter-write into the KV cache buffer along the sequence dimension), which has no built-in CoreML equivalent. The custom op translates it into CoreML's `slice_update` primitive.
+- Only required when converting the model to CoreML format on Apple Silicon.
 
 ## RoPE (Rotary Position Embedding) Implementation
 
-This fork **avoids complex number tensors** (no `torch.view_as_complex`) for CoreML compatibility. Instead, real and imaginary parts are tracked separately:
+The upstream implementation uses `torch.polar` / `torch.view_as_complex` to treat the rotation as complex-number multiplication. CoreML has poor support for complex (imaginary-number) tensors, so **this fork rewrites RoPE entirely in real arithmetic** — no complex dtypes are used anywhere.
+
+`precompute_freqs_cis()` returns a `(real, imag)` tuple of ordinary float tensors (cos and sin of the frequency angles). `apply_rotary_emb()` performs the rotation using the standard 2D rotation formula:
 
 ```python
-# In precompute_freqs_cis():
-freqs_cis_real, freqs_cis_imag = cos(freqs), sin(freqs)
+# precompute_freqs_cis() — returns two real tensors instead of one complex tensor
+freqs_cis_real = cos(freqs)   # was: torch.polar(...) → complex64
+freqs_cis_imag = sin(freqs)
 
-# In apply_rotary_emb():
+# apply_rotary_emb() — explicit rotation, no view_as_complex / view_as_real
 x_real, x_imag = chunk(x, 2, dim=-1)
 rot_real = x_real * freqs_cis_real - x_imag * freqs_cis_imag
 rot_imag = x_real * freqs_cis_imag + x_imag * freqs_cis_real
 ```
 
-Gemma 3 uses **two separate RoPE tables**:
+The commented-out original code (`torch.polar`, `torch.view_as_complex`, `torch.view_as_real`) is preserved inline as a reference.
+
+Gemma 3 uses **two separate RoPE tables**, each stored as a `(real, imag)` buffer pair:
 - `local_freqs_cis` — `theta=10_000` for `LOCAL_SLIDING` layers.
-- `global_freqs_cis` — `theta=1_000_000` (with optional `rope_scaling_factor`) for `GLOBAL` layers.
+- `global_freqs_cis` — `theta=1_000_000` (divided by `rope_scaling_factor` when set) for `GLOBAL` layers.
 
 ## KV Cache Design
 
-- Gemma 1/2 (`GemmaForCausalLM`): `GemmaKvCache` is stored as model buffers, initialised on each `generate()` call via `model.initialise_cache(batch_size, max_seq_len, device)`.
-- Gemma 3 (`Gemma3ForMultimodalLM`): KV caches are created as local tensors per `generate()` call and passed through the forward call stack.
+CoreML (since coremltools ≥9.0) supports a **State** concept: tensors that are part of the model graph and persist across inference calls, analogous to PyTorch `register_buffer`. This fork maps the KV cache directly onto that abstraction.
+
+### Gemma 1/2 — buffer-based (`GemmaKvCache`)
+
+`GemmaKvCache` is an `nn.Module` that owns the cache as **registered buffers** (`register_buffer`), one `k_cache_i` / `v_cache_i` pair per layer. This makes the cache part of the model's state dict and moves with the model when `.to(device)` is called — the same contract as CoreML State.
+
+Lifecycle:
+1. `GemmaModel.__init__` creates a single `GemmaKvCache` instance and holds a reference to it.
+2. Before each `generate()` call, `model.model.initialise_cache(batch_size, max_seq_len, device)` allocates the buffers (zeros, `float16`).
+3. During the forward pass, `GemmaKvCache.update(layer_index, kv_write_indices, keys, values)` writes new K/V entries via `index_copy_` (dim=1, sequence dimension).
+4. The `GemmaAttention` layer holds a reference to the shared `GemmaKvCache` and calls `update()` directly — there is no per-layer cache argument threaded through `forward()`.
+
+### Gemma 3 — local tensors (`Gemma3ForMultimodalLM`)
+
+Gemma 3's `generate()` allocates KV caches as plain `torch.zeros` tensors at the start of each call and threads them as a `List[Tuple[Tensor, Tensor]]` through the forward stack. These are **not** registered buffers. The design predates the buffer refactor and has not yet been migrated.
 
 ## Attention Variants
 
