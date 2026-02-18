@@ -117,10 +117,42 @@ Key classes (in dependency order):
 - Images are normalized to mean=0.5, std=0.5, clipped to `[-1, 1]`.
 - `pan_and_scan.py` — crops large images into at most 4 sub-crops for better resolution.
 
-### `ops/tensor_transformation.py`
-- Registers a custom CoreML MIL op (`index_copy`) via `coremltools`.
-- Needed because `GemmaKvCache.update()` calls `index_copy_` (scatter-write into the KV cache buffer along the sequence dimension), which has no built-in CoreML equivalent. The custom op translates it into CoreML's `slice_update` primitive.
-- Only required when converting the model to CoreML format on Apple Silicon.
+### `ops/` — CoreML custom operator package
+
+The `ops/` package bridges PyTorch ops that have no CoreML equivalent, enabling the model to be converted and run on Apple Silicon via `coremltools`.
+
+**`ops/__init__.py`**
+Imports `index_copy` from `tensor_transformation`, which triggers `@register_torch_op` side-effect registration. Importing `ops` is sufficient to make all custom ops available before any CoreML conversion call.
+
+**`ops/tensor_transformation.py`**
+Registers `index_copy` as a custom CoreML MIL op using the `@register_torch_op` decorator from `coremltools.converters.mil.frontend.torch`. The op translates `torch.Tensor.index_copy_` (scatter-write along an arbitrary dimension) into CoreML's `mb.slice_update` primitive.
+
+Needed because `GemmaKvCache.update()` calls `index_copy_` along the sequence dimension (dim=1) to write new K/V entries into the buffer cache — a pattern that CoreML does not support natively.
+
+> **Status (in progress):** The `index_copy_` path is not yet fully exercised end-to-end. In `ops/tests/test_tensor_transformation.py`, the `TestTensorIndexCopySlice.forward()` currently performs a broadcast multiply instead of the real `index_copy_` call (which is commented out). The custom op translation is implemented but the full round-trip through CoreML conversion and execution is still being validated.
+
+**`ops/tests/test_util.py`** — CoreML conversion pipeline helpers
+Three utility functions used by all CoreML tests:
+
+| Function | Purpose |
+|---|---|
+| `torch_export_model(model, inputs, dynamic_shapes)` | Exports the PyTorch model to ATen IR via `torch.export.export`, then runs `run_decompositions({})` to lower to a form CoreML can consume |
+| `coreml_convert_model(aten_program, states=None)` | Converts to CoreML MLProgram format; targets **iOS 18** (`ct.target.iOS18`), uses `ct.ComputeUnit.ALL`, and accepts a `states` list of `ct.StateType` descriptors for persistent tensors |
+| `run_coreml_model(model, inputs, state_kv=None)` | Runs inference; when a `state_kv=(name, numpy_array)` pair is supplied it calls `model.make_state()`, `state.write_state(name, value)`, then `model.predict(inputs, state=state)` — the standard CoreML State API |
+
+The `states` / `ct.StateType` mechanism maps directly onto PyTorch `register_buffer`: a buffer declared in Python becomes a CoreML State tensor that persists across inference calls.
+
+**`ops/standalone_test_runner.py`**
+Runs `test_index_copy()` directly as a `__main__` script without pytest, so that full Python stack traces (rather than pytest's captured output) are visible during development.
+
+**`ops/tests/test_tensor_transformation.py`**
+End-to-end test of the buffer ↔ CoreML State round-trip:
+1. Creates a model with a `register_buffer` target (mimicking `GemmaKvCache`).
+2. Exports with `torch.export` using dynamic shapes for batch and index dimensions.
+3. Converts to CoreML with `ct.StateType(ct.TensorType(shape=..., dtype=float16))` wrapping the buffer.
+4. Runs CoreML inference via `run_coreml_model(..., state_kv=('target', ...))`.
+
+Note: CoreML State requires `float32` for `write_state` even when the underlying dtype is `float16` (see inline comment `### Bah! use float32 not float16`). MPS device is required; tests fail on Linux/CUDA.
 
 ## RoPE (Rotary Position Embedding) Implementation
 
