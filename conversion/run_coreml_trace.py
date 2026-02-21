@@ -3,7 +3,6 @@ import random
 
 import numpy as np
 import torch
-from click.core import batch
 from torch.export import Dim
 
 import coremltools as ct
@@ -14,7 +13,7 @@ from gemma import model as gemma_model
 
 from ops.tensor_transformation import index_copy, multinomial
 
-from util.generation import PredictorInterface, TorchPredictor, CoreMlPredictor
+from util.generation import PredictorInterface, TorchPredictor, CoreMlPredictor, tokenize_prompts
 
 
 @contextlib.contextmanager
@@ -64,7 +63,8 @@ def main():
         "Can the brain burn ketones instead of glucose?",
     ]
     batch_size = len(prompts)
-    output_len = 100
+
+    max_new_tokens = 100
     temperature = 1.0
     top_p = 0.95
     top_k = 64
@@ -73,7 +73,7 @@ def main():
     prompt_tokens = [torch_model.tokenizer.encode(prompt) for prompt in prompts]
     min_prompt_len = min(len(p) for p in prompt_tokens)
     max_prompt_len = max(len(p) for p in prompt_tokens)
-    max_seq_len = max_prompt_len + output_len
+    max_seq_len = max_prompt_len + max_new_tokens
 
     torch_model.model.initialise_cache(batch_size, max_seq_len, device=device)
 
@@ -115,6 +115,28 @@ def main():
         [temperature] * batch_size).to(device)
     top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
     top_ks_tensor = torch.LongTensor([top_k] * batch_size).to(device)
+
+    # inputs = tokenize_prompts(torch_model, prompts, output_len=max_new_tokens, device=device)
+
+
+    # # Run the PyTorch model
+    # gen_input_token_ids_tensor = inputs['input_token_ids']
+    # gen_input_positions_tensor = inputs['input_positions']
+    # gen_output_positions_tensor = inputs['output_positions']
+    # gen_curr_mask_tensor = inputs['mask']
+    # gen_curr_local_mask_tensor = inputs['local_mask']
+    #
+    # token_ids_tensor = inputs['input_token_ids']
+    #
+    # min_prompt_len = inputs['min_prompt_len']
+    # max_seq_len = inputs['max_seq_len']
+    #
+    #
+    #
+    # # Initialize cache for expected outputs
+    # torch_model.model.initialise_cache(batch_size, max_seq_len, device=device)
+
+
 
     # Run the PyTorch model
     gen_input_token_ids_tensor = input_token_ids_tensor.clone()
@@ -164,7 +186,7 @@ def main():
     results = []
     for i, tokens in enumerate(token_ids):
       trimmed_output = tokens[len(prompt_tokens[i]):len(prompt_tokens[i])
-                                    + output_len]
+                                    + max_new_tokens]
       if torch_model.tokenizer.eos_id in trimmed_output:
         eos_index = trimmed_output.index(torch_model.tokenizer.eos_id)
         trimmed_output = trimmed_output[:eos_index]

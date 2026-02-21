@@ -84,7 +84,7 @@ class Sampler(nn.Module):
                              index=torch.argsort(probs_idx, dim=-1))
 
         next_token_ids = torch.multinomial(probs,
-                                           1,
+                                           num_samples=1,
                                            replacement=True).squeeze(dim=-1)
         return next_token_ids, logits
 

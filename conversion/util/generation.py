@@ -98,12 +98,12 @@ def tokenize_prompts(
         prompts: Union[str, Sequence[str]],
         output_len=int,
         device=Any
-) -> List[List[str]]:
+) -> dict:
     """Return tokenized prompt as padded tensors.
     """
     # Tokenize batch
     if isinstance(prompts, str):
-        prompts = list(prompts)
+        prompts = [prompts]
     prompt_tokens = [torch_model.tokenizer.encode(prompt) for prompt in prompts]
 
     # Get token lengths
@@ -111,9 +111,6 @@ def tokenize_prompts(
     min_prompt_len = min(len(p) for p in prompt_tokens)
     max_prompt_len = max(len(p) for p in prompt_tokens)
     max_seq_len = max_prompt_len + output_len
-
-    # Initialize cache for expected outputs
-    torch_model.model.initialise_cache(batch_size, max_seq_len, device=device)
 
     # Prepare inputs
     token_ids_tensor = torch.full((batch_size, max_seq_len),
@@ -150,23 +147,35 @@ def tokenize_prompts(
     # Sampling params
     output_positions_tensor = torch.LongTensor([min_prompt_len - 1]).to(device)
 
-
     return {
         'input_token_ids': input_token_ids_tensor,
         'input_positions': input_positions_tensor,
         'mask': curr_mask_tensor,
         'output_positions': output_positions_tensor,
         'local_mask': curr_local_mask_tensor,
+        'min_prompt_len':min_prompt_len,
+        'max_seq_len': max_seq_len,
     }
 
 
 def generate(
-        self,
-        prompts: Union[str, Sequence[str]],
-        device: Any,
-        output_len: int = 100,
+        torch_model: GemmaForCausalLM,
+        pred_model: PredictorInterface,
+        input_token_ids: torch.Tensor,
+        input_positions: torch.Tensor,
+        mask: torch.Tensor,
+        output_positions: torch.Tensor,
+        local_mask: torch.Tensor,
+        min_prompt_len: torch.Tensor,
+        max_seq_len: torch.Tensor,
         temperature: Union[float, None] = 1.0,
         top_p: float = 0.95,
         top_k: int = 64,
-) -> Union[str, Sequence[str]]:
+        device=Any,
+) -> torch.Tensor:
+
+    # Initialize cache for expected outputs
+    torch_model.model.initialise_cache(batch_size, max_seq_len, device=device)
+
+
     pass
