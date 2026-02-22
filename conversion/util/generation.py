@@ -53,6 +53,7 @@ class TorchPredictor(PredictorInterface):
 class CoreMlPredictor(PredictorInterface):
     def __init__(self, coreml_model):
         self.coreml_model = coreml_model
+        self.model_state: MLState = self.coreml_model.make_state()
 
     def __call__(
             self,
@@ -73,31 +74,36 @@ class CoreMlPredictor(PredictorInterface):
         input_positions_tensor_val = input_positions.cpu().to(dtype=torch_dtype_coreml_int).numpy()
         mask_tensor_val = mask.cpu().to(dtype=torch_dtype_coreml_float).numpy()
         output_positions_tensor_val = output_positions.cpu().to(dtype=torch_dtype_coreml_int).numpy()
-        temperatures_tensor_val = temperatures.cpu().to(dtype=torch_dtype_coreml_float).numpy()
         top_ps_tensor_val = top_ps.cpu().to(dtype=torch_dtype_coreml_float).numpy()
         top_ks_tensor_val = top_ks.cpu().to(dtype=torch_dtype_coreml_int).numpy()
-        local_mask_tensor_val = local_mask.cpu().to(dtype=torch_dtype_coreml_float).numpy()
 
         coreml_inputs = {
             'input_token_ids': input_token_ids_tensor_val,
             'input_positions': input_positions_tensor_val,
             'mask': mask_tensor_val,
             'output_positions': output_positions_tensor_val,
-            'temperatures': temperatures_tensor_val,
             'top_ps': top_ps_tensor_val,
             'top_ks': top_ks_tensor_val,
-            'local_mask': local_mask_tensor_val,
         }
-        model_state: MLState = self.coreml_model.make_state()
-        next_tokens, logits = self.coreml_model.predict(coreml_inputs, state=model_state)
+
+        if temperatures is not None:
+            coreml_inputs['temperatures'] = temperatures.cpu().to(
+                dtype=torch_dtype_coreml_float).numpy()
+
+        if local_mask is not None:
+            coreml_inputs['local_mask'] = local_mask.cpu().to(
+                dtype=torch_dtype_coreml_float).numpy()
+
+        next_tokens, logits = self.coreml_model.predict(
+            coreml_inputs, state=self.model_state)
         return torch.from_numpy(next_tokens), torch.from_numpy(logits)
 
 
 def tokenize_prompts(
         torch_model: GemmaForCausalLM,
         prompts: Union[str, Sequence[str]],
-        output_len=int,
-        device=Any
+        output_len: int = 100,
+        device: Any = None
 ) -> dict:
     """Return tokenized prompt as padded tensors.
     """
@@ -171,8 +177,10 @@ def generate(
         temperature: Union[float, None] = 1.0,
         top_p: float = 0.95,
         top_k: int = 64,
-        device=Any,
+        device: Any = None,
 ) -> torch.Tensor:
+
+    batch_size = input_token_ids.shape[0]
 
     # Initialize cache for expected outputs
     torch_model.model.initialise_cache(batch_size, max_seq_len, device=device)
