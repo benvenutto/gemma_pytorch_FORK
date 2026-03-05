@@ -640,12 +640,9 @@ class GemmaForCausalLM(nn.Module):
             input_positions: torch.Tensor,
             mask: torch.Tensor,
             output_positions: torch.Tensor,
-            temperatures: Union[torch.Tensor, None],
-            top_ps: torch.Tensor,
-            top_ks: torch.Tensor,
             local_mask: torch.Tensor | None = None,
             **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         freqs_cis = {}
 
         if self.config.architecture == gemma_config.Architecture.GEMMA_3:
@@ -685,19 +682,21 @@ class GemmaForCausalLM(nn.Module):
             mask=mask,
             local_mask=local_mask,
         )
+
+        # Logit computation (position selection + projection + softcapping).
+        # Sampling is handled externally by the caller.
         embedder_weight = self.embedder.weight
         if self.config.quant:
             embedder_weight = (
                     embedder_weight * self.embedder.weight_scaler.unsqueeze(-1))
-        next_tokens, logits = self.sampler(
-            embedding=embedder_weight,
-            hidden_states=hidden_states,
-            output_positions=output_positions,
-            temperatures=temperatures,
-            top_ps=top_ps,
-            top_ks=top_ks,
-        )
-        return next_tokens, logits
+        hidden_states = hidden_states[:, output_positions].squeeze(dim=1)
+        logits = torch.matmul(hidden_states, embedder_weight.t())
+        if self.config.final_logit_softcapping is not None:
+            logits = logits / self.config.final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * self.config.final_logit_softcapping
+
+        return logits
 
     def generate(
             self,

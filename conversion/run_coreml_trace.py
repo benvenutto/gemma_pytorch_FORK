@@ -6,7 +6,6 @@ import torch
 from torch.export import Dim
 
 import coremltools as ct
-from coremltools.models.model import MLState
 
 from gemma import config
 from gemma import model as gemma_model
@@ -111,19 +110,13 @@ def main():
         if local_mask_tensor is not None else None
 
     output_positions_tensor = torch.LongTensor([min_prompt_len - 1]).to(device)
-    temperatures_tensor = torch.FloatTensor([1.0] * batch_size).to(device)
-    top_ps_tensor = torch.FloatTensor([0.95] * batch_size).to(device)
-    top_ks_tensor = torch.LongTensor([64] * batch_size).to(device)
 
-    # Setup model parameters & dynamic shapes
+    # Setup model parameters & dynamic shapes (no sampling params — sampling is external)
     model_params = (
         input_token_ids_tensor,
         input_positions_tensor,
         curr_mask_tensor,
         output_positions_tensor,
-        temperatures_tensor,
-        top_ps_tensor,
-        top_ks_tensor,
         curr_local_mask_tensor,
     )
 
@@ -136,9 +129,6 @@ def main():
         'input_positions': (seq_dim, ),
         'mask': (None, None, seq_dim, None, ),
         'output_positions': (None,),
-        'temperatures': None,
-        'top_ps': None,
-        'top_ks': None,
         'local_mask': (None, None, seq_dim, None, ),
     }
 
@@ -166,7 +156,7 @@ def main():
         minimum_deployment_target=ct.target.iOS18,
         compute_units=ct.ComputeUnit.ALL,
         states=state_model,
-        outputs=[ct.TensorType(name='next_tokens', dtype=np.int32), ct.TensorType(name='logits')]
+        outputs=[ct.TensorType(name='logits')]
     )
 
     print(f">> CoreML model:\n{coreml_model}")
@@ -182,15 +172,7 @@ def main():
         device=device,
     )
 
-    # Debug: check for out-of-range token IDs
-    vocab_size = model_config.vocab_size
-    for i, ids in enumerate(coreml_output_ids):
-        bad_ids = [(pos, tid) for pos, tid in enumerate(ids) if tid < 0 or tid >= vocab_size]
-        if bad_ids:
-            print(f"  Prompt {i}: {len(bad_ids)} out-of-range tokens (first 5: {bad_ids[:5]})")
-
-    coreml_results = [torch_model.tokenizer.decode(
-        [t for t in ids if 0 <= t < vocab_size]) for ids in coreml_output_ids]
+    coreml_results = [torch_model.tokenizer.decode(ids) for ids in coreml_output_ids]
     print(f"CoreML model result is: {coreml_results}")
 
 

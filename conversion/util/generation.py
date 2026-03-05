@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Union, Tuple, Any
+from typing import Union, Any
 
 import torch
 from gemma.config import GemmaConfig
@@ -13,12 +13,9 @@ class PredictorInterface(ABC):
             input_positions: torch.Tensor,
             mask: torch.Tensor,
             output_positions: torch.Tensor,
-            temperatures: Union[torch.Tensor, None],
-            top_ps: torch.Tensor,
-            top_ks: torch.Tensor,
             local_mask: torch.Tensor | None = None,
-            **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        """Run the model forward pass and return logits."""
         pass
 
     @abstractmethod
@@ -36,20 +33,13 @@ class TorchPredictor(PredictorInterface):
             input_positions: torch.Tensor,
             mask: torch.Tensor,
             output_positions: torch.Tensor,
-            temperatures: Union[torch.Tensor, None],
-            top_ps: torch.Tensor,
-            top_ks: torch.Tensor,
             local_mask: torch.Tensor | None = None,
-            **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         return self.torch_model(
             input_token_ids,
             input_positions,
             mask,
             output_positions,
-            temperatures,
-            top_ps,
-            top_ks,
             local_mask,
         )
 
@@ -69,34 +59,17 @@ class CoreMlPredictor(PredictorInterface):
             input_positions: torch.Tensor,
             mask: torch.Tensor,
             output_positions: torch.Tensor,
-            temperatures: Union[torch.Tensor, None],
-            top_ps: torch.Tensor,
-            top_ks: torch.Tensor,
             local_mask: torch.Tensor | None = None,
-            **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         torch_dtype_coreml_int = torch.int32
         torch_dtype_coreml_float = torch.float32
 
-        input_token_ids_tensor_val = input_token_ids.cpu().to(dtype=torch_dtype_coreml_int).numpy()
-        input_positions_tensor_val = input_positions.cpu().to(dtype=torch_dtype_coreml_int).numpy()
-        mask_tensor_val = mask.cpu().to(dtype=torch_dtype_coreml_float).numpy()
-        output_positions_tensor_val = output_positions.cpu().to(dtype=torch_dtype_coreml_int).numpy()
-        top_ps_tensor_val = top_ps.cpu().to(dtype=torch_dtype_coreml_float).numpy()
-        top_ks_tensor_val = top_ks.cpu().to(dtype=torch_dtype_coreml_int).numpy()
-
         coreml_inputs = {
-            'input_token_ids': input_token_ids_tensor_val,
-            'input_positions': input_positions_tensor_val,
-            'mask': mask_tensor_val,
-            'output_positions': output_positions_tensor_val,
-            'top_ps': top_ps_tensor_val,
-            'top_ks': top_ks_tensor_val,
+            'input_token_ids': input_token_ids.cpu().to(dtype=torch_dtype_coreml_int).numpy(),
+            'input_positions': input_positions.cpu().to(dtype=torch_dtype_coreml_int).numpy(),
+            'mask': mask.cpu().to(dtype=torch_dtype_coreml_float).numpy(),
+            'output_positions': output_positions.cpu().to(dtype=torch_dtype_coreml_int).numpy(),
         }
-
-        if temperatures is not None:
-            coreml_inputs['temperatures'] = temperatures.cpu().to(
-                dtype=torch_dtype_coreml_float).numpy()
 
         if local_mask is not None:
             coreml_inputs['local_mask'] = local_mask.cpu().to(
@@ -104,12 +77,61 @@ class CoreMlPredictor(PredictorInterface):
 
         device = input_token_ids.device
         preds = self.coreml_model.predict(coreml_inputs, state=self.model_state)
-        next_tokens = torch.from_numpy(preds['next_tokens']).to(dtype=torch.int64, device=device)
         logits = torch.from_numpy(preds['logits']).to(device)
-        return next_tokens, logits
+        return logits
 
     def reset(self, batch_size: int, max_seq_len: int, device: Any) -> None:
         self.model_state = self.coreml_model.make_state()
+
+
+def sample(
+        logits: torch.Tensor,
+        temperatures: Union[torch.Tensor, None],
+        top_ps: torch.Tensor,
+        top_ks: torch.Tensor,
+) -> torch.Tensor:
+    """Sample next token IDs from logits.
+
+    Args:
+        logits: (batch_size, vocab_size) logits after softcapping.
+        temperatures: (batch_size,) temperature per item, or None for greedy.
+        top_ps: (batch_size,) nucleus sampling threshold.
+        top_ks: (batch_size,) top-k sampling threshold.
+
+    Returns:
+        (batch_size,) tensor of sampled token IDs (int64).
+    """
+    if temperatures is None:
+        return torch.argmax(logits, dim=-1).squeeze(dim=-1)
+
+    # Apply temperature scaling.
+    logits.div_(temperatures.unsqueeze(dim=1))
+
+    # Calculate probabilities with softmax.
+    probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+
+    # Apply top-p, top-k.
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    top_ps_mask = (probs_sum - probs_sort) > top_ps.unsqueeze(dim=1)
+    probs_sort = torch.where(top_ps_mask, 0.0, probs_sort)
+
+    top_ks_mask = torch.arange(probs_idx.shape[-1],
+                               device=probs_idx.device)
+    top_ks_mask = top_ks_mask.expand(probs_idx.shape[0], -1)
+    top_ks_mask = top_ks_mask >= top_ks.unsqueeze(dim=1)
+    probs_sort = torch.where(top_ks_mask, 0.0, probs_sort)
+
+    # Re-normalization.
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    probs = torch.gather(probs_sort,
+                         dim=-1,
+                         index=torch.argsort(probs_idx, dim=-1))
+
+    next_token_ids = torch.multinomial(probs,
+                                       num_samples=1,
+                                       replacement=True).squeeze(dim=-1)
+    return next_token_ids
 
 
 def generate(
@@ -197,16 +219,15 @@ def generate(
 
     output_index = torch.tensor([min_prompt_len], dtype=torch.int64).to(device)
     for i in range(max_seq_len - min_prompt_len):
-        next_token_ids, logits = pred_model(
+        logits = pred_model(
             input_token_ids=gen_input_token_ids,
             input_positions=gen_input_positions,
             mask=gen_curr_mask,
             output_positions=gen_output_positions,
-            temperatures=temperatures_tensor,
-            top_ps=top_ps_tensor,
-            top_ks=top_ks_tensor,
             local_mask=gen_curr_local_mask,
         )
+        next_token_ids = sample(logits, temperatures_tensor,
+                                top_ps_tensor, top_ks_tensor)
 
         curr_prompt_mask = prompt_mask_tensor[:, output_index].squeeze(dim=1)
         curr_token_ids = token_ids_tensor[:, output_index].squeeze(dim=1)
